@@ -1,0 +1,18 @@
+name: WSL Runner Test
+on: [push]
+
+jobs:
+  hello-wsl:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Say Hello
+        run: |
+          echo "Hello Jin! GitHub Actions is successfully running on your WSL."
+          hostname
+          date
+
+      - name: Check Terraform
+        run: terraform --version

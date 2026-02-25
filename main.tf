@@ -1,53 +1,39 @@
-variable "git_repo_url" {
-  description = "Git repository URL"
-  type        = string
-  default     = "https://github.com/J0632714/llm_driven_aws_build_test.git"
-}
-
-variable "repo_name" {
-  description = "Repository name after clone"
-  type        = string
-  default     = "llm_driven_aws_build_test"
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
 }
 
 provider "aws" {
   region = "ap-northeast-1"
 }
 
-resource "aws_key_pair" "deployer" {
-  key_name   = "ec2_app_deploy_key"
-  public_key = file("~/.ssh/id_rsa.pub")
+variable "git_repo_url" {
+  type        = string
+  default     = "https://github.com/J0632714/llm_driven_aws_build_test.git"
+  description = "Git リポジトリの URL（このプロジェクト全体を clone する）"
 }
 
-resource "aws_security_group" "app_sg" {
-  name        = "app_ec2_sg"
-  description = "Allow port 8000"
-  vpc_id      = data.aws_vpc.default.id
-
-  ingress {
-    description      = "Allow HTTP for FastAPI"
-    from_port        = 8000
-    to_port          = 8000
-    protocol         = "tcp"
-    cidr_blocks      = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port        = 0
-    to_port          = 0
-    protocol         = "-1"
-    cidr_blocks      = ["0.0.0.0/0"]
-  }
+variable "repo_name" {
+  type        = string
+  default     = "llm_driven_aws_build_test"
+  description = "Git リポジトリ名（clone 後のディレクトリ名）"
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
+variable "ssh_public_key_path" {
+  type        = string
+  default     = "~/.ssh/id_rsa.pub"
+  description = "SSH 公開鍵ファイルのパス（絶対パスを推奨）"
+}
 
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server-*"]
-  }
+variable "instance_type" {
+  type        = string
+  default     = "t3.micro"
+  description = "EC2 インスタンスタイプ"
 }
 
 data "aws_vpc" "default" {
@@ -58,59 +44,130 @@ data "aws_subnet_ids" "default" {
   vpc_id = data.aws_vpc.default.id
 }
 
-resource "aws_instance" "app" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = "t3.micro"
-  subnet_id                   = data.aws_subnet_ids.default.ids[0]
-  vpc_security_group_ids      = [aws_security_group.app_sg.id]
-  key_name                    = aws_key_pair.deployer.key_name
+locals {
+  first_subnet_id = tolist(data.aws_subnet_ids.default.ids)[0]
+}
+
+data "aws_ami" "amazon_linux_2" {
+  owners      = ["amazon"]
+  most_recent = true
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_key_pair" "app_key" {
+  key_name   = "fastapi-app-key"
+  public_key = file(var.ssh_public_key_path)
+}
+
+resource "aws_security_group" "fastapi_sg" {
+  name        = "fastapi-app-sg"
+  description = "Security group for FastAPI app on port 8000"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "Allow FastAPI app port 8000"
+    from_port   = 8000
+    to_port     = 8000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Allow SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   tags = {
-    Name = "fastapi-app-server"
+    Name = "fastapi-app-sg"
   }
+}
+
+resource "aws_instance" "fastapi_app" {
+  ami                         = data.aws_ami.amazon_linux_2.id
+  instance_type               = var.instance_type
+  subnet_id                   = local.first_subnet_id
+  vpc_security_group_ids      = [aws_security_group.fastapi_sg.id]
+  associate_public_ip_address = true
+  key_name                    = aws_key_pair.app_key.key_name
 
   user_data = <<-EOF
     #!/bin/bash
-    set -e
+    set -euxo pipefail
 
-    adduser --disabled-password --gecos "" appuser
-    apt-get update
-    apt-get install -y python3 python3-venv git
+    # Create application user
+    id appuser || useradd -m -s /bin/bash appuser
 
-    cd /home/appuser
-    git clone ${var.git_repo_url}
-    chown -R appuser:appuser /home/appuser/${var.repo_name}
+    # Install dependencies
+    yum update -y
+    yum install -y git python3 python3-pip
 
-    cd /home/appuser/${var.repo_name}/app
+    # Clone the entire repository into appuser's home
+    su - appuser -c "git clone ${var.git_repo_url}"
 
-    sudo -u appuser python3 -m venv venv
-    sudo -u appuser /home/appuser/${var.repo_name}/app/venv/bin/pip install --upgrade pip
-    sudo -u appuser /home/appuser/${var.repo_name}/app/venv/bin/pip install -r requirements.txt
+    # Move to app directory and set up virtualenv
+    su - appuser -c "cd ${var.repo_name}/app && python3 -m venv /home/appuser/${var.repo_name}/app/.venv"
 
-    if [ -f /home/appuser/${var.repo_name}/app/.env ]; then
-      cp /home/appuser/${var.repo_name}/app/.env /home/appuser/${var.repo_name}/app/.env
-    fi
+    # Install Python dependencies
+    su - appuser -c "/home/appuser/${var.repo_name}/app/.venv/bin/pip install --upgrade pip"
+    su - appuser -c "/home/appuser/${var.repo_name}/app/.venv/bin/pip install -r /home/appuser/${var.repo_name}/app/requirements.txt"
 
-    cat << EOT > /etc/systemd/system/fastapi-app.service
+    # Prepare .env if missing
+    if [ ! -f /home/appuser/${var.repo_name}/app/.env ]; then cp /home/appuser/${var.repo_name}/app/.env.example /home/appuser/${var.repo_name}/app/.env 2>/dev/null || true; fi
+
+    # Ensure ownership of app directory
+    chown -R appuser:appuser /home/appuser/${var.repo_name}/app
+
+    # Create systemd service
+    cat > /etc/systemd/system/fastapi-app.service <<SERVICE
     [Unit]
-    Description=FastAPI Uvicorn App
+    Description=FastAPI App (Uvicorn)
     After=network.target
 
     [Service]
+    Type=simple
     User=appuser
-    Group=appuser
     WorkingDirectory=/home/appuser/${var.repo_name}/app
     EnvironmentFile=/home/appuser/${var.repo_name}/app/.env
-    ExecStart=/home/appuser/${var.repo_name}/app/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    ExecStart=/home/appuser/${var.repo_name}/app/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
     Restart=always
+    RestartSec=5
+    Environment=PATH=/home/appuser/${var.repo_name}/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
     [Install]
     WantedBy=multi-user.target
-    EOT
+    SERVICE
 
-    chown appuser:appuser /etc/systemd/system/fastapi-app.service
     systemctl daemon-reload
     systemctl enable fastapi-app
     systemctl start fastapi-app
   EOF
+
+  tags = {
+    Name = "fastapi-app-ec2"
+  }
+}
+
+output "instance_public_ip" {
+  value = aws_instance.fastapi_app.public_ip
+}
+
+output "instance_public_dns" {
+  value = aws_instance.fastapi_app.public_dns
 }

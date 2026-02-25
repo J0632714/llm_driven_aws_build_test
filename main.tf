@@ -3,7 +3,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = ">= 5.0"
     }
   }
 }
@@ -15,43 +15,19 @@ provider "aws" {
 variable "git_repo_url" {
   type        = string
   default     = "https://github.com/J0632714/llm_driven_aws_build_test.git"
-  description = "Git repository URL that contains the app/ directory"
+  description = "Git repository URL that contains the app/ directory."
 }
 
 variable "repo_name" {
   type        = string
   default     = "llm_driven_aws_build_test"
-  description = "Repository name (directory created after git clone)"
+  description = "Repository name (directory name after git clone)."
 }
 
 variable "ssh_public_key_path" {
   type        = string
   default     = "~/.ssh/id_rsa.pub"
-  description = "Path to your SSH public key file (absolute path is recommended)"
-}
-
-variable "instance_type" {
-  type        = string
-  default     = "t3.micro"
-  description = "EC2 instance type for FastAPI app"
-}
-
-variable "key_pair_name" {
-  type        = string
-  default     = "fastapi-app-key"
-  description = "Name of the EC2 key pair"
-}
-
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnet_ids" "default" {
-  vpc_id = data.aws_vpc.default.id
-}
-
-locals {
-  first_subnet_id = tolist(data.aws_subnet_ids.default.ids)[0]
+  description = "Path to your SSH public key file (absolute path is recommended)."
 }
 
 data "aws_ami" "amazon_linux_2" {
@@ -62,25 +38,35 @@ data "aws_ami" "amazon_linux_2" {
     name   = "name"
     values = ["amzn2-ami-hvm-*-x86_64-gp2"]
   }
+}
 
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
   filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
   }
 }
 
-resource "aws_key_pair" "this" {
-  key_name   = var.key_pair_name
+locals {
+  first_subnet_id = tolist(data.aws_subnets.default.ids)[0]
+}
+
+resource "aws_key_pair" "default" {
+  key_name   = "fastapi-app-key"
   public_key = file(var.ssh_public_key_path)
 }
 
 resource "aws_security_group" "fastapi_sg" {
   name        = "fastapi-app-sg"
-  description = "Security group for FastAPI app on port 8000"
+  description = "Security group for FastAPI app"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description = "Allow HTTP traffic to FastAPI app"
+    description = "Allow HTTP for FastAPI app on port 8000"
     from_port   = 8000
     to_port     = 8000
     protocol    = "tcp"
@@ -109,73 +95,66 @@ resource "aws_security_group" "fastapi_sg" {
 
 resource "aws_instance" "fastapi_app" {
   ami                    = data.aws_ami.amazon_linux_2.id
-  instance_type          = var.instance_type
+  instance_type          = "t3.micro"
   subnet_id              = local.first_subnet_id
   vpc_security_group_ids = [aws_security_group.fastapi_sg.id]
-  key_name               = aws_key_pair.this.key_name
-  associate_public_ip_address = true
+  key_name               = aws_key_pair.default.key_name
 
   user_data = <<-EOF
               #!/bin/bash
-              set -xe
+              set -euxo pipefail
 
-              # Create application user
+              # Create app user
               id appuser &>/dev/null || useradd -m -s /bin/bash appuser
 
-              # Install system packages
+              # Update system
               yum update -y
+
+              # Install dependencies
               yum install -y git python3 python3-pip
-
-              # Ensure pip / venv
               python3 -m pip install --upgrade pip
-              python3 -m pip install virtualenv
 
-              # Switch to appuser home
-              cd /home/appuser
-
-              # Clone repository
-              if [ ! -d "/home/appuser/${var.repo_name}" ]; then
-                git clone ${var.git_repo_url}
-              fi
-
-              cd /home/appuser/${var.repo_name}/app
+              # Clone repository as appuser
+              su - appuser -c "git clone ${var.git_repo_url}"
 
               # Create virtual environment
-              python3 -m venv venv
-              chown -R appuser:appuser /home/appuser/${var.repo_name}
+              su - appuser -c "python3 -m venv /home/appuser/${var.repo_name}/app/venv"
 
-              # Activate venv and install dependencies
-              su - appuser -c "cd /home/appuser/${var.repo_name}/app && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt"
+              # Install Python dependencies
+              su - appuser -c \"/home/appuser/${var.repo_name}/app/venv/bin/pip install --upgrade pip\"
+              su - appuser -c \"/home/appuser/${var.repo_name}/app/venv/bin/pip install -r /home/appuser/${var.repo_name}/app/requirements.txt\"
 
-              # Ensure .env exists (copy from .env.example only if .env does not exist)
+              # Prepare .env if not exists
               if [ ! -f /home/appuser/${var.repo_name}/app/.env ]; then
                 cp /home/appuser/${var.repo_name}/app/.env.example /home/appuser/${var.repo_name}/app/.env 2>/dev/null || true
               fi
 
+              chown -R appuser:appuser /home/appuser/${var.repo_name}
+
               # Create systemd service
-              cat >/etc/systemd/system/fastapi-app.service << 'EOL'
+              cat << 'SERVICE' > /etc/systemd/system/fastapi-app.service
               [Unit]
-              Description=FastAPI app service
+              Description=FastAPI Application Service
               After=network.target
 
               [Service]
               Type=simple
               User=appuser
+              Group=appuser
               WorkingDirectory=/home/appuser/${var.repo_name}/app
-              EnvironmentFile=-/home/appuser/${var.repo_name}/app/.env
+              EnvironmentFile=/home/appuser/${var.repo_name}/app/.env
               ExecStart=/home/appuser/${var.repo_name}/app/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000
               Restart=always
               RestartSec=5
 
               [Install]
               WantedBy=multi-user.target
-              EOL
+              SERVICE
 
-              # Permissions and service enable
-              chown -R appuser:appuser /home/appuser/${var.repo_name}
+              # Reload systemd and start service
               systemctl daemon-reload
-              systemctl enable fastapi-app.service
-              systemctl start fastapi-app.service
+              systemctl enable fastapi-app
+              systemctl start fastapi-app
               EOF
 
   tags = {
